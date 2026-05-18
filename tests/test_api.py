@@ -344,7 +344,7 @@ class TestWebhooks:
     @pytest.mark.asyncio
     async def test_subscribe_and_list(self, client: httpx.AsyncClient) -> None:
         resp = await client.post(
-            "/webhooks/subscribe",
+            "/webhooks",
             json={
                 "callback_url": "https://example.com/hook",
                 "agencies": ["epa_tsca"],
@@ -356,14 +356,14 @@ class TestWebhooks:
         assert data["is_active"] is True
         assert "secret" not in data
 
-        resp2 = await client.get("/webhooks/subscriptions")
+        resp2 = await client.get("/webhooks")
         assert resp2.status_code == 200
         assert len(resp2.json()) == 1
 
     @pytest.mark.asyncio
     async def test_unsubscribe(self, client: httpx.AsyncClient) -> None:
         resp = await client.post(
-            "/webhooks/subscribe",
+            "/webhooks",
             json={
                 "callback_url": "https://example.com/hook",
                 "agencies": [],
@@ -374,10 +374,274 @@ class TestWebhooks:
         resp2 = await client.delete(f"/webhooks/subscriptions/{sub_id}")
         assert resp2.status_code == 204
 
-        resp3 = await client.get("/webhooks/subscriptions")
+        resp3 = await client.get("/webhooks")
         assert resp3.json() == []
 
     @pytest.mark.asyncio
     async def test_unsubscribe_404(self, client: httpx.AsyncClient) -> None:
         resp = await client.delete("/webhooks/subscriptions/00000000-0000-0000-0000-000000000000")
         assert resp.status_code == 404
+
+
+# ── Webhook Integration: scrape → diff → webhook fires ────────────────
+
+
+class TestWebhookIntegration:
+    """
+    End-to-end test: register a webhook, trigger a scrape that produces
+    a change, and assert the webhook receives the correct JSON payload.
+    """
+
+    @pytest.mark.asyncio
+    async def test_webhook_fires_on_change(self, client: httpx.AsyncClient) -> None:
+        """
+        1. Register a webhook for epa_tsca.
+        2. Scrape v1 → creates new records (no change events).
+        3. Scrape v2 (modified HTML) → change detected, webhook fires.
+        4. Assert the webhook payload matches the ChangeEvent.
+        """
+        import json as _json
+
+        import app.scrapers.epa_tsca as epa_module
+        from app.engine.webhook import WebhookDispatcher
+
+        # ── Step 1: Register a webhook subscriber ──────────────────
+        captured_payloads: list[dict] = []
+
+        original_post = WebhookDispatcher._post_one
+
+        async def _capture_post(
+            self,
+            client_inner: httpx.AsyncClient,
+            sub,
+            payload_json: str,
+        ) -> bool:
+            captured_payloads.append(_json.loads(payload_json))
+            return True
+
+        WebhookDispatcher._post_one = _capture_post  # type: ignore[method-assign]
+
+        try:
+            resp = await client.post(
+                "/webhooks",
+                json={
+                    "callback_url": "https://example.com/hook",
+                    "agencies": ["epa_tsca"],
+                },
+            )
+            assert resp.status_code == 201
+
+            # ── Step 2: Scrape v1 (first run → new records, no changes) ──
+            original_scrape = epa_module.EPATSCAScraper.scrape
+
+            html_v1 = _SAMPLE_TSCA_HTML
+            html_v2 = _SAMPLE_TSCA_HTML.replace(
+                "<td>Benzene</td><td>71-43-2</td><td>No</td>",
+                "<td>Benzene</td><td>71-43-2</td><td>RESTRICTED</td>",
+            )
+            call_count = [0]
+
+            async def _mock_scrape(self):
+                call_count[0] += 1
+                return epa_module.parse_tsca_html(html_v2 if call_count[0] > 1 else html_v1)
+
+            epa_module.EPATSCAScraper.scrape = _mock_scrape  # type: ignore[method-assign]
+
+            try:
+                r1 = await client.post("/scrape", json={"source": "epa_tsca"})
+                assert r1.status_code == 200
+                assert r1.json()["ok"] is True
+                assert r1.json()["report"]["new_count"] == 2
+                assert r1.json()["report"]["has_changes"] is False
+                # No webhook should fire for new records only.
+                assert len(captured_payloads) == 0
+
+                # ── Step 3: Scrape v2 → change detected ────────────
+                r2 = await client.post("/scrape", json={"source": "epa_tsca"})
+                assert r2.status_code == 200
+                report = r2.json()["report"]
+                assert report["changed_count"] == 1
+                assert report["has_changes"] is True
+                change_ids = report["change_ids"]
+                assert len(change_ids) == 1
+
+                # ── Step 4: Assert webhook payload ─────────────────
+                assert len(captured_payloads) == 1
+                payload = captured_payloads[0]
+
+                # Top-level fields
+                assert payload["version"] == "1"
+                assert payload["event_id"] == change_ids[0]
+                assert payload["source"] == "epa_tsca"
+                assert payload["record_id"] is not None
+                assert len(payload["previous_hash"]) == 64
+                assert len(payload["new_hash"]) == 64
+                assert payload["previous_hash"] != payload["new_hash"]
+                assert "diff_summary" in payload
+                assert "--- previous" in payload["diff_summary"]
+                assert "+++ current" in payload["diff_summary"]
+                assert "detected_at" in payload
+
+                # Verify the ChangeEvent was marked dispatched
+                change_id = change_ids[0]
+                resp3 = await client.get(f"/records/{payload['record_id']}/history")
+                events = resp3.json()
+                matching = [e for e in events if e["id"] == change_id]
+                assert len(matching) == 1
+                assert matching[0]["dispatched"] is True
+
+            finally:
+                epa_module.EPATSCAScraper.scrape = original_scrape  # type: ignore[method-assign]
+        finally:
+            WebhookDispatcher._post_one = original_post  # type: ignore[method-assign]
+
+    @pytest.mark.asyncio
+    async def test_webhook_filtered_by_agency(self, client: httpx.AsyncClient) -> None:
+        """
+        A webhook registered only for 'echa_reach' should NOT fire for
+        an 'epa_tsca' change.
+        """
+        import json as _json
+
+        import app.scrapers.epa_tsca as epa_module
+        from app.engine.webhook import WebhookDispatcher
+
+        captured_payloads: list[dict] = []
+        original_post = WebhookDispatcher._post_one
+
+        async def _capture_post(
+            self,
+            client_inner: httpx.AsyncClient,
+            sub,
+            payload_json: str,
+        ) -> bool:
+            captured_payloads.append(_json.loads(payload_json))
+            return True
+
+        WebhookDispatcher._post_one = _capture_post  # type: ignore[method-assign]
+
+        try:
+            # Register webhook for echa_reach only
+            resp = await client.post(
+                "/webhooks",
+                json={
+                    "callback_url": "https://example.com/hook",
+                    "agencies": ["echa_reach"],
+                },
+            )
+            assert resp.status_code == 201
+
+            # Scrape twice to trigger an epa_tsca change
+            original_scrape = epa_module.EPATSCAScraper.scrape
+            call_count = [0]
+
+            html_v2 = _SAMPLE_TSCA_HTML.replace(
+                "<td>Benzene</td><td>71-43-2</td><td>No</td>",
+                "<td>Benzene</td><td>71-43-2</td><td>MODIFIED</td>",
+            )
+
+            async def _mock_scrape(self):
+                call_count[0] += 1
+                return epa_module.parse_tsca_html(
+                    html_v2 if call_count[0] > 1 else _SAMPLE_TSCA_HTML
+                )
+
+            epa_module.EPATSCAScraper.scrape = _mock_scrape  # type: ignore[method-assign]
+
+            try:
+                await client.post("/scrape", json={"source": "epa_tsca"})
+                r2 = await client.post("/scrape", json={"source": "epa_tsca"})
+                assert r2.json()["report"]["has_changes"] is True
+                # The webhook should NOT fire because it's filtered to echa_reach.
+                assert len(captured_payloads) == 0
+            finally:
+                epa_module.EPATSCAScraper.scrape = original_scrape  # type: ignore[method-assign]
+        finally:
+            WebhookDispatcher._post_one = original_post  # type: ignore[method-assign]
+
+    @pytest.mark.asyncio
+    async def test_webhook_payload_has_correct_event_fields(
+        self, client: httpx.AsyncClient
+    ) -> None:
+        """
+        Verify every field of the webhook JSON payload is correct
+        against the ChangeEvent that was persisted.
+        """
+        import json as _json
+
+        import app.scrapers.epa_tsca as epa_module
+        from app.engine.webhook import WebhookDispatcher
+
+        captured_payloads: list[dict] = []
+        original_post = WebhookDispatcher._post_one
+
+        async def _capture_post(
+            self,
+            client_inner: httpx.AsyncClient,
+            sub,
+            payload_json: str,
+        ) -> bool:
+            captured_payloads.append(_json.loads(payload_json))
+            return True
+
+        WebhookDispatcher._post_one = _capture_post  # type: ignore[method-assign]
+
+        try:
+            await client.post(
+                "/webhooks",
+                json={
+                    "callback_url": "https://example.com/hook",
+                    "agencies": [],  # all agencies
+                },
+            )
+
+            original_scrape = epa_module.EPATSCAScraper.scrape
+            call_count = [0]
+            html_v2 = _SAMPLE_TSCA_HTML.replace(
+                "<td>Benzene</td><td>71-43-2</td><td>No</td>",
+                "<td>Benzene</td><td>71-43-2</td><td>BANNED</td>",
+            )
+
+            async def _mock_scrape(self):
+                call_count[0] += 1
+                return epa_module.parse_tsca_html(
+                    html_v2 if call_count[0] > 1 else _SAMPLE_TSCA_HTML
+                )
+
+            epa_module.EPATSCAScraper.scrape = _mock_scrape  # type: ignore[method-assign]
+
+            try:
+                await client.post("/scrape", json={"source": "epa_tsca"})
+                await client.post("/scrape", json={"source": "epa_tsca"})
+
+                assert len(captured_payloads) == 1
+                p = captured_payloads[0]
+
+                # Structural assertions
+                assert set(p.keys()) == {
+                    "version",
+                    "event_id",
+                    "source",
+                    "record_id",
+                    "previous_hash",
+                    "new_hash",
+                    "diff_summary",
+                    "detected_at",
+                }
+                assert p["version"] == "1"
+                assert p["source"] == "epa_tsca"
+                assert len(p["previous_hash"]) == 64
+                assert len(p["new_hash"]) == 64
+                assert p["previous_hash"] != p["new_hash"]
+                # diff_summary is a unified diff string
+                assert isinstance(p["diff_summary"], str)
+                assert "---" in p["diff_summary"]
+                assert "+++" in p["diff_summary"]
+                # detected_at is ISO 8601
+                from datetime import datetime as _dt
+
+                _dt.fromisoformat(p["detected_at"])
+            finally:
+                epa_module.EPATSCAScraper.scrape = original_scrape  # type: ignore[method-assign]
+        finally:
+            WebhookDispatcher._post_one = original_post  # type: ignore[method-assign]
