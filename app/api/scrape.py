@@ -1,5 +1,7 @@
 """
 Scrape API — trigger a scrape + diff pipeline for a regulatory source.
+
+After diffing, any new ChangeEvents are dispatched to registered webhooks.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_session
 from app.engine.diff_engine import DiffEngine
+from app.engine.webhook import WebhookDispatcher
 from app.schemas import DiffReportOut, ScrapeRequest, ScrapeResponse
 
 router = APIRouter()
@@ -70,6 +73,12 @@ async def trigger_scrape(
     try:
         engine = DiffEngine(session)
         report = await engine.process(results)
+
+        # ── Dispatch webhooks for new ChangeEvents ───────────────────────
+        if report.has_changes:
+            dispatcher = WebhookDispatcher(session)
+            await dispatcher.dispatch_all(report.changes, payload.source)
+
         await session.commit()
     except Exception as exc:
         await session.rollback()

@@ -45,7 +45,7 @@ app.add_middleware(
 # Routers
 # --------------------------------------------------
 app.include_router(records_router, prefix="/records", tags=["Records"])
-app.include_router(webhooks_router, prefix="/webhooks", tags=["Webhooks"])
+app.include_router(webhooks_router, tags=["Webhooks"])
 app.include_router(scrape_router, tags=["Scrape"])
 
 
