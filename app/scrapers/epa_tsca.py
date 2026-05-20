@@ -90,7 +90,7 @@ def parse_tsca_html(html: str, *, base_url: str = TSCA_INVENTORY_URL) -> list[Sc
 
 
 def _parse_row(cells: list[Tag], fetched_at: datetime) -> ScrapeResult | None:
-    """Extract a ScrapeResult from a <tr> row's cells."""
+    """Extract a ScrapeResult from a <try> row's cells."""
     text_cells = [c.get_text(" ", strip=True) for c in cells]
 
     # Heuristic: first cell = name/title, second cell = CASRN/id

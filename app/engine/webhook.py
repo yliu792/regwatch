@@ -37,7 +37,7 @@ def _sign_payload(secret: str, payload: str) -> str:
 
 
 def _build_payload(event: ChangeEvent, source: str) -> dict:
-    """Build the JSON-serialisable webhook payload for a single ChangeEvent."""
+    """Build the JSON-serializable webhook payload for a single ChangeEvent."""
     return {
         "version": _WEBHOOK_PAYLOAD_VERSION,
         "event_id": str(event.id),
@@ -99,7 +99,7 @@ class WebhookDispatcher:
         async with httpx.AsyncClient(timeout=timeout) as client:
             for event in events:
                 payload = _build_payload(event, source)
-                payload_json: str | None = None  # lazily serialised
+                payload_json: str | None = None  # lazily serialized
 
                 for sub in subscriptions:
                     if not sub.is_active:
@@ -172,7 +172,7 @@ class WebhookDispatcher:
 
 
 def _serialise(payload: dict) -> str:
-    """Fast JSON serialisation without Pydantic overhead."""
+    """Fast JSON serialization without Pydantic overhead."""
     import json
 
     return json.dumps(payload, default=str)
