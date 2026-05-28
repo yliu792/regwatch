@@ -40,3 +40,9 @@ alembic/versions/*.pyc
 
 # --- Docker ---
 pgdata/
+
+# --- Other ---
+*.md
+!README.md
+
+
